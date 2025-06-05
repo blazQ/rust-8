@@ -1,0 +1,9 @@
+[package]
+name = "rust-8"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pixels = "0.15.0"
+rand = "0.9.1"
+winit = "0.30.11"

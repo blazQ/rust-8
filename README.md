@@ -18,13 +18,13 @@ cargo run
 
 # Load a specific ROM
 cargo run pong.ch8
-cargo run --nomerom space_invaders.ch8
+cargo run --rom space_invaders.ch8
 
 # Adjust CPU speed
 cargo run --tickcpu 1000
 
 # Combine options
-cargo run --nomerom breakout.ch8 --tickcpu 500
+cargo run --rom breakout.ch8 --tickcpu 500
 
 # Show help
 cargo run --help

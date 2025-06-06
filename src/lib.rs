@@ -1,10 +1,4 @@
-use std::{
-    fs,
-    io::{self, Write},
-    path::Path,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fs, path::Path};
 
 use rand::prelude::*;
 
@@ -33,6 +27,14 @@ const FONT_SET: [u8; 80] = [
 ];
 const STACK_SIZE: usize = 16;
 
+// TODO: Handle input instructions
+//      - Publicly accessible keyboard DONE
+//      - Caller modifies the keyboard, instructions behavior regardless of what modifies it DONE
+//      - Input thread on the caller
+// TODO: Abstract display so that it can be used with terminal and window based solutions
+//      - Winit/wGPU
+//      - Terminal DONE
+
 pub struct Chip8 {
     // Chip 8 Main Memory
     // 4096 KB.
@@ -58,42 +60,9 @@ pub struct Chip8 {
     display: [[bool; DISPLAY_SIZE_X_KB]; DISPLAY_SIZE_Y_KB],
     update_display: bool,
 
-    keyboard: [bool; 16],
+    pub keyboard: [bool; 16],
+    waiting_for_key: Option<usize>,
 }
-
-// TODO: DONE
-// Implementare il caricamento della rom. DONE
-// 1. Caricare il contenuto del binary file e caricarlo in memoria a partire dall'indirizzo 0x200. DONE
-// 2. Implementare il fetch, decode, execute loop:
-//      - A ogni passo, il PC (che inizia da 0x200), legge i byte in posizione PC e PC+1. DONE
-//      - Li combina in una istruzione a 16 bit. DONE
-//      - Esegue la logica dell'istruzione. DONE
-//      - Incrementa di 2 il PC per passare alla prossima. DONE
-// Le istruzioni in memoria seguono uno schema ricorrente
-// TL;DR:
-//      - Decidere se istanziare l'emulatore per forza con la rom o poterlo istanziare senza (catena del tipo let emulator = Chip8::new().load_rom(filepath).run() non è male.)
-//      - Creare una funzione che carica il programma in memoria. DONE
-//      - Creare una funzione che decodifica le istruzioni DONE
-//          - Prende in input una coppia di byte e li fonde DONE
-//          - Ne estrapola il pattern per capire che istruzione è DONE
-//      - Creare le funzioni associate a ogni istruzione in modo tale che possano venire eseguite nel loop DONE
-//      - Creare l'interfaccia grafica che rappresenterà il display che verrà aggiornato
-//      - The end?
-
-// TODO: DONE
-// Implementare fetch, decode, execute fully fledged out
-
-// TODO: DONE
-// Implementare:
-//   Funzione leggere il contenuto della memoria
-//   Funzione per eseguire un programma una istruzione alla volta e vedere la memoria
-//   Stampare l'istruzione decodificata
-
-// TODO: Implementare le altre istruzioni
-//          - In particolare le istruzioni che richiedono input
-// TODO: Interfacciarsi con libreria per disegnare sullo schermo e non su terminale URGENT
-// TODO: Sistemare il timing del fetch/decode/execute loop DONE
-// TODO: Evitare di ridisegnare lo schermo se non ci sono cambiamenti. DONE
 
 impl Chip8 {
     pub fn new() -> Chip8 {
@@ -109,6 +78,7 @@ impl Chip8 {
             sound: 0,
             v: [0; 16],
             keyboard: [false; 16],
+            waiting_for_key: None,
         };
 
         // Ogni istanza dell'emulatore deve avere i font caricati in memoria da 050 a 09F (80-159)
@@ -162,29 +132,35 @@ impl Chip8 {
             0x5 => Ok(Instruction::SEQR(x, y)), // 5xnn - Skip if v[x] and v[y] are not equal
             0x6 => Ok(Instruction::Set(x, nn)), // 6xnn - Set Vx = nn
             0x7 => Ok(Instruction::Add(x, nn)), // 7xnn - Add nn to Vx
-            0x8 => {
-                match n {
-                    0 => Ok(Instruction::SetRegister(x, y)),
-                    1 => Ok(Instruction::OR(x, y)),
-                    2 => Ok(Instruction::AND(x, y)),
-                    3 => Ok(Instruction::XOR(x, y)),
-                    4 => Ok(Instruction::AddRegister(x, y)),
-                    5 => Ok(Instruction::Subtract(x, y)),
-                    6 => {Ok(Instruction::RShift(x, y))},
-                    7 => Ok(Instruction::SubtractInv(x, y)),
-                    0xE=> {Ok(Instruction::LShift(x, y))},
-                    _ => Err(format!("Unknown 0x8 instruction: 0x{:04X}", opcode)),
-                }
-            }
+            0x8 => match n {
+                0 => Ok(Instruction::SetRegister(x, y)),
+                1 => Ok(Instruction::OR(x, y)),
+                2 => Ok(Instruction::AND(x, y)),
+                3 => Ok(Instruction::XOR(x, y)),
+                4 => Ok(Instruction::AddRegister(x, y)),
+                5 => Ok(Instruction::Subtract(x, y)),
+                6 => Ok(Instruction::RShift(x, y)),
+                7 => Ok(Instruction::SubtractInv(x, y)),
+                0xE => Ok(Instruction::LShift(x, y)),
+                _ => Err(format!("Unknown 0x8 instruction: 0x{:04X}", opcode)),
+            },
+
             0x9 => Ok(Instruction::SNEQR(x, y)),
             0xA => Ok(Instruction::SetIndex(nnn)), // Annn - Set I = nnn
             0xB => Ok(Instruction::JumpOffset(nnn)),
             0xC => Ok(Instruction::Random(x, nn)), // Cxnn - Random
             0xD => Ok(Instruction::Display(x, y, n)), // Dxyn - Display sprite
+            0xE => match nn {
+                0x9E => Ok(Instruction::SkipIfKey(x)),
+                0xA1 => Ok(Instruction::SkipIfNotKey(x)),
+                _ => Err(format!("Unknown 0xE instruction: 0x{:04X}", opcode)),
+            },
+
             0xF => match nn {
                 0x07 => Ok(Instruction::GetDelayTimer(x)),
                 0x15 => Ok(Instruction::SetDelayTimer(x)),
                 0x18 => Ok(Instruction::SetSoundTimer(x)),
+                0x0A => Ok(Instruction::GetKey(x)),
                 0x29 => Ok(Instruction::GetFontCharacter(x)),
                 0x33 => Ok(Instruction::BinaryToDecimal(x)),
                 0x1E => Ok(Instruction::AddToIndex(x)),
@@ -209,6 +185,7 @@ impl Chip8 {
             // Jumps to memory address nnn
             Instruction::Jump(nnn) => self.program_counter = nnn,
 
+            // TODO: Quirk
             Instruction::JumpOffset(nnn) => self.program_counter = nnn + self.v[0] as u16,
 
             // Adds to register v[x] the number nn.
@@ -225,6 +202,7 @@ impl Chip8 {
 
                 self.v[x] = self.v[y].wrapping_sub(self.v[x]);
             }
+
             // Set register v[x] content to nn.
             Instruction::Set(x, nn) => self.v[x] = nn,
 
@@ -321,10 +299,13 @@ impl Chip8 {
                 }
             }
 
+            // Sets register v[x] to the value in v[y]
             Instruction::SetRegister(x, y) => {
                 self.v[x] = self.v[y];
             }
 
+            // Adds v[y] to [v[x] and saves to v[x].
+            // Carries to v[F] if there's overflow.
             Instruction::AddRegister(x, y) => {
                 let (result, overflow) = self.v[x].overflowing_add(self.v[y]);
 
@@ -333,18 +314,23 @@ impl Chip8 {
                 self.v[x] = result;
             }
 
+            // Gets the delay timer
             Instruction::GetDelayTimer(x) => {
                 self.v[x] = self.delay;
             }
 
+            // Sets the delay timer
             Instruction::SetDelayTimer(x) => {
                 self.delay = self.v[x];
             }
 
+            // Sets the sound timer
             Instruction::SetSoundTimer(x) => {
                 self.sound = self.v[x];
             }
 
+            // Calls subroutine at memory location nnn.
+            // Pushes current program counter value to the stack, sets program counter to nnn.
             Instruction::Call(nnn) => {
                 // Push current PC to stack
                 self.stack[self.sp] = self.program_counter;
@@ -353,50 +339,92 @@ impl Chip8 {
                 self.program_counter = nnn;
             }
 
+            // Pops the stack and returns from whence it came
             Instruction::Return => {
                 // Pop PC from stack
                 self.sp -= 1;
                 self.program_counter = self.stack[self.sp];
             }
 
+            // Adds value in v[x] to the index register
             Instruction::AddToIndex(x) => self.i = self.i.wrapping_add(self.v[x] as u16),
 
+            // Stores what's in registers from 0 to x included and loades them in memory, at locations i + j.
             Instruction::StoreMemory(x) => {
-                for i in 0..=x {
-                    self.memory[self.i as usize + i] = self.v[i];
+                for j in 0..=x {
+                    self.memory[self.i as usize + j] = self.v[j];
                 }
             }
 
+            // Same as before.
+            // TODO: Quirk
             Instruction::LoadMemory(x) => {
                 for i in 0..=x {
                     self.v[i] = self.memory[self.i as usize + i];
                 }
             }
 
+            // Gets the font character referenced by v[x] and loads it in the index register.
             Instruction::GetFontCharacter(x) => {
                 self.i = FONT_MEMORY_START as u16 + (self.v[x] as u16 * 5);
             }
 
+            // Converts binary to decimal, naive.
             Instruction::BinaryToDecimal(x) => {
                 let to_convert = self.v[x];
                 self.memory[self.i as usize] = to_convert / 100;
                 self.memory[self.i as usize + 1] = (to_convert / 10) % 10;
                 self.memory[self.i as usize + 2] = to_convert % 10;
-            },
+            }
 
+            // Lshift shifts the contents of v[x] to v[y], shifts it to the right and saves the shifted bit to v[f].
+            // TODO: Quirk
             Instruction::LShift(x, y) => {
                 let bit = (self.v[y] & 0x80) >> 7;
                 self.v[x] = self.v[y] << 1;
                 self.v[0xF] = bit;
-            },
+            }
 
+            // TODO: Quirk
             Instruction::RShift(x, y) => {
                 let bit = self.v[y] & 1;
                 self.v[x] = self.v[y] >> 1;
                 self.v[0xF] = bit;
-            },
+            }
 
-            _ => {}
+            Instruction::SkipIfKey(x) => {
+                let key = self.v[x] & 0xF;
+                if key < 16 && self.keyboard[key as usize] {
+                    self.program_counter += 2;
+                }
+            }
+
+            Instruction::SkipIfNotKey(x) => {
+                let key = self.v[x] & 0xF;
+                if key < 16 && !self.keyboard[key as usize] {
+                    self.program_counter += 2;
+                }
+            }
+
+            Instruction::GetKey(x) => {
+                let mut key_found = None;
+                for (key_index, &pressed) in self.keyboard.iter().enumerate() {
+                    if pressed {
+                        key_found = Some(key_index as u8);
+                        break;
+                    }
+                }
+
+                if let Some(key) = key_found {
+                    // Tasto trovato - salvalo e continua
+                    self.v[x] = key;
+                    self.waiting_for_key = None;
+                } else {
+                    // Nessun tasto premuto - aspetta
+                    self.waiting_for_key = Some(x);
+                    self.program_counter -= 2; // Ripeti questa istruzione
+                }
+            }
         }
         Ok(())
     }
@@ -413,99 +441,58 @@ impl Chip8 {
     }
 
     pub fn print_display(&self) {
-        // Clear the terminal screen (optional)
         print!("\x1B[2J\x1B[1;1H");
 
         for row in &self.display {
             for &pixel in row {
                 if pixel {
-                    print!("██"); // Full block for ON pixels
+                    print!("██");
                 } else {
-                    print!("  "); // Two spaces for OFF pixels
+                    print!("  ");
                 }
             }
-            println!(); // New line after each row
+            println!();
         }
-        println!(); // Extra line for spacing
-    }
-    pub fn print_screen(&self) {
-        println!()
+        println!();
     }
 
-    pub fn run(&mut self) -> Result<(), String> {
-        let mut last_timer_update = Instant::now();
-        let mut last_display_update = Instant::now();
-
-        let cpu_freq = Duration::from_nanos(1_000_000_000 / 700);
-        let timer_freq = Duration::from_nanos(1_000_000_000 / 60);
-        let display_freq = Duration::from_millis(16);
-
-        loop {
-            let cycle_start = Instant::now();
-
+    // Esegue N cicli di CPU (ticks)
+    pub fn run(&mut self, ticks: usize) -> Result<(), String> {
+        for _ in 0..ticks {
             let opcode = self.fetch();
-            // Handle error in decoding
             let instruction = self.decode(opcode)?;
-
-            // Handle error in execution
             self.execute(instruction)?;
 
-            if last_timer_update.elapsed() >= timer_freq {
-                if self.delay > 0 {
-                    self.delay -= 1;
-                }
-                if self.sound > 0 {
-                    self.sound -= 1;
-                    // TODO: Play beep sound
-                }
-                last_timer_update = Instant::now();
-            }
-
-            // Update display at ~60 FPS
-            // Only if the instruction changes the display.
-            if last_display_update.elapsed() >= display_freq && self.update_display {
-                self.print_display();
-                last_display_update = Instant::now();
-                self.update_display = false;
-            }
-
-            // Sleep to maintain target CPU frequency
-            let elapsed = cycle_start.elapsed();
-            if elapsed < cpu_freq {
-                thread::sleep(cpu_freq - elapsed);
-            }
-        }
-    }
-
-    pub fn run_debug(&mut self) -> Result<(), String> {
-        loop {
-            // Show current state
-            println!("PC: 0x{:03X} | I: 0x{:03X}", self.program_counter, self.i);
-
-            let opcode = self.fetch();
-            println!("Opcode: 0x{:04X}", opcode);
-
-            let instruction = self.decode(opcode)?;
-            println!("Instruction: {:?}", instruction);
-
-            self.execute(instruction)?;
-            self.print_display();
-
-            // Wait for user input
-            print!("Press Enter to continue (or 'q' to quit): ");
-            io::stdout().flush().unwrap();
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).unwrap();
-
-            if input.trim().to_lowercase() == "q" {
+            // Se stiamo aspettando un tasto, ferma l'esecuzione
+            if self.waiting_for_key.is_some() {
                 break;
             }
         }
         Ok(())
     }
+
+    // Aggiorna i timer (chiamato separatamente a 60Hz), dal chiamante
+    pub fn tick_timers(&mut self) {
+        if self.delay > 0 {
+            self.delay -= 1;
+        }
+        if self.sound > 0 {
+            self.sound -= 1;
+        }
+    }
+
+    pub fn should_update_display(&mut self) -> bool {
+        if self.update_display {
+            self.update_display = false;
+            true
+        } else {
+            false
+        }
+    }
 }
 
+
+// Contiene tutte l'instruction set.
 #[derive(Debug)]
 enum Instruction {
     Clear,
